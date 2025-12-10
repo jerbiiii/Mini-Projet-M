@@ -1,0 +1,39 @@
+// src/main/idl/ProductionControl.idl
+module ProductionControlModule {
+
+    // Interface pour le contrôle des machines de production
+    interface IProductionControl {
+        // Enregistrer une machine auprès du contrôleur
+        boolean registerMachine(in string machineId, in string machineType);
+
+        // Notifier le contrôleur d'une panne
+        string notifyFailure(in string machineId, in string errorType);
+
+        // Demander le démarrage de la production
+        boolean requestProductionStart(in string machineId);
+
+        // Demander l'arrêt de la production
+        boolean requestProductionStop(in string machineId);
+
+        // Notifier d'une alerte de stockage (vide ou plein)
+        void notifyStorageAlert(in string zoneId, in long level);
+
+        // Obtenir le statut d'une machine
+        string getMachineStatus(in string machineId);
+    };
+
+    // Interface pour le contrôle de la station d'assemblage
+    interface IStationControl {
+        // Enregistrer une station d'assemblage
+        boolean registerAssemblyStation(in string stationId);
+
+        // Notifier d'un problème de qualité
+        void notifyQualityIssue(in string details);
+
+        // Demander une maintenance
+        boolean requestMaintenance(in string machineId);
+
+        // Obtenir les commandes de production
+        string getProductionCommand(in string stationId);
+    };
+};

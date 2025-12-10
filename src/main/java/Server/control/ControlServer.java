@@ -2,7 +2,7 @@ package Server.control;
 
 import common.MachineInfo;
 import common.MachineInfo.MachineStatus;
-import common.Message;
+import common.Component;
 import org.omg.CORBA.ORB;
 import org.omg.CosNaming.NameComponent;
 import org.omg.CosNaming.NamingContextExt;
@@ -11,222 +11,195 @@ import org.omg.PortableServer.POA;
 import org.omg.PortableServer.POAHelper;
 import ProductionControlModule.*;
 
-import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.*;
 
 public class ControlServer {
-    private static final int SOCKET_PORT = 5000;
-    private static final String CORBA_HOST = "localhost";
     private static final int CORBA_PORT = 1050;
-
     private ORB orb;
-    private ProductionControlServant productionControlServant;
-    private StationControlServant stationControlServant;
-    private ServerSocket serverSocket;
-    private ExecutorService threadPool;
+    private ProductionControlServant servant;
 
-    private final Map<String, MachineInfo> machineRegistry = new ConcurrentHashMap<>();
-    private final Map<String, String> assemblyStationRegistry = new ConcurrentHashMap<>();
+    private final Map<String, MachineInfo> machines = new ConcurrentHashMap<>();
+    private final Map<String, IStationCallback> stations = new ConcurrentHashMap<>();
     private final Map<String, Integer> storageStatus = new ConcurrentHashMap<>();
-    private final Map<String, Socket> activeConnections = new ConcurrentHashMap<>();
-    private final Object productionLock = new Object();
 
-    public ControlServer() {
-        this.threadPool = Executors.newFixedThreadPool(20);
-    }
+    // Thread pool pour éviter les blocages
+    private final ExecutorService executor = Executors.newCachedThreadPool();
 
-    public void startCORBAServer(String[] args) {
+    public void start(String[] args) {
         try {
-            printHeader("DÉMARRAGE SERVEUR CORBA");
+            log("╔═══════════════════════════════════════════════════╗");
+            log("║     SERVEUR DE CONTRÔLE - VERSION FINALE         ║");
+            log("╚═══════════════════════════════════════════════════╝");
+            log("");
 
             Properties props = new Properties();
-            props.put("org.omg.CORBA.ORBInitialHost", CORBA_HOST);
             props.put("org.omg.CORBA.ORBInitialPort", String.valueOf(CORBA_PORT));
+            props.put("org.omg.CORBA.ORBInitialHost", "localhost");
             orb = ORB.init(args, props);
 
             POA rootPOA = POAHelper.narrow(orb.resolve_initial_references("RootPOA"));
             rootPOA.the_POAManager().activate();
 
-            productionControlServant = new ProductionControlServant(this);
-            stationControlServant = new StationControlServant(this);
+            servant = new ProductionControlServant(this);
+            org.omg.CORBA.Object ref = rootPOA.servant_to_reference(servant);
+            IProductionControl controlRef = IProductionControlHelper.narrow(ref);
 
-            org.omg.CORBA.Object refProduction = rootPOA.servant_to_reference(productionControlServant);
-            IProductionControl productionRef = IProductionControlHelper.narrow(refProduction);
+            try {
+                org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
+                NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+                NameComponent[] path = ncRef.to_name("ProductionControl");
+                ncRef.rebind(path, controlRef);
+                success("✓ Service CORBA enregistré");
+            } catch (Exception e) {
+                error("✗ ERREUR: orbd n'est pas démarré!");
+                info("  Lancez d'abord: orbd -ORBInitialPort 1050 -ORBInitialHost localhost");
+                System.exit(1);
+            }
 
-            org.omg.CORBA.Object refStation = rootPOA.servant_to_reference(stationControlServant);
-            IStationControl stationRef = IStationControlHelper.narrow(refStation);
+            success("✓ Serveur opérationnel (Port: " + CORBA_PORT + ")");
+            divider();
+            info("🎛️  EN ATTENTE DE CONNEXIONS...\n");
 
-            org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
-            NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
-
-            NameComponent[] pathProduction = ncRef.to_name("ProductionControl");
-            ncRef.rebind(pathProduction, productionRef);
-
-            NameComponent[] pathStation = ncRef.to_name("StationControl");
-            ncRef.rebind(pathStation, stationRef);
-
-            printSuccess("Serveur CORBA opérationnel (Port: " + CORBA_PORT + ")");
-
-            Thread orbThread = new Thread(() -> orb.run());
-            orbThread.start();
+            orb.run();
 
         } catch (Exception e) {
-            printError("Erreur CORBA: " + e.getMessage());
+            error("Erreur serveur: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    public void startSocketServer() {
-        try {
-            printHeader("DÉMARRAGE SERVEUR SOCKET");
-            serverSocket = new ServerSocket(SOCKET_PORT);
-            printSuccess("Serveur Socket opérationnel (Port: " + SOCKET_PORT + ")");
-            printDivider();
-            printInfo("🎛️  SYSTÈME PRÊT - En attente de connexions...\n");
+    // === MACHINES ===
 
-            while (!serverSocket.isClosed()) {
-                Socket clientSocket = serverSocket.accept();
-                threadPool.execute(new ClientHandler(clientSocket));
-            }
-        } catch (IOException e) {
-            if (!serverSocket.isClosed()) {
-                printError("Erreur Socket: " + e.getMessage());
-            }
-        }
+    public boolean registerMachine(String machineId, String machineType) {
+        MachineInfo info = new MachineInfo(machineId, machineType);
+        machines.put(machineId, info);
+
+        divider();
+        success("🔧 MACHINE ENREGISTRÉE");
+        info("   ID: " + machineId);
+        info("   Type: " + machineType);
+        info("   Total machines: " + machines.size());
+        divider();
+
+        return true;
     }
 
-    private class ClientHandler implements Runnable {
-        private Socket socket;
-        private BufferedReader in;
-        private PrintWriter out;
-        private String clientId;
+    public boolean startMachine(String machineId) {
+        MachineInfo machine = machines.get(machineId);
+        if (machine != null && machine.getStatus() != MachineStatus.FAILED) {
+            machine.setStatus(MachineStatus.RUNNING);
+            success("▶️  Machine " + machineId + " démarrée");
+            return true;
+        }
+        return false;
+    }
 
-        public ClientHandler(Socket socket) {
-            this.socket = socket;
+    public boolean stopMachine(String machineId) {
+        MachineInfo machine = machines.get(machineId);
+        if (machine != null) {
+            machine.setStatus(MachineStatus.STOPPED);
+            success("⏹️  Machine " + machineId + " arrêtée");
+            return true;
+        }
+        return false;
+    }
+
+    public String getMachineStatus(String machineId) {
+        MachineInfo machine = machines.get(machineId);
+        return machine != null ? machine.getStatus().toString() : "UNKNOWN";
+    }
+
+    // === COMPOSANTS ===
+
+    public boolean deliverComponent(Component component) {
+        divider();
+        info("📦 COMPOSANT REÇU");
+        info("   ID: " + component.getComponentId());
+        info("   Type: " + component.getType());
+        info("   De: " + component.getProducedBy());
+
+        if (component.isDefective()) {
+            warning("   ❌ DÉFECTUEUX - Rejeté");
+            divider();
+            return false;
         }
 
-        @Override
-        public void run() {
-            try {
-                in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                out = new PrintWriter(socket.getOutputStream(), true);
+        // Utiliser un thread séparé pour éviter le deadlock
+        CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(() -> {
+            for (Map.Entry<String, IStationCallback> entry : stations.entrySet()) {
+                try {
+                    ComponentData data = new ComponentData(
+                            component.getComponentId(),
+                            component.getType(),
+                            component.getProducedBy(),
+                            component.isDefective()
+                    );
 
-                String inputLine;
-                while ((inputLine = in.readLine()) != null) {
-                    Message message = Message.deserialize(inputLine);
-                    if (message != null) {
-                        handleSocketMessage(message, out);
+                    // Appel CORBA avec timeout implicite
+                    boolean accepted = entry.getValue().receiveComponent(data);
+                    if (accepted) {
+                        success("   ✓ Livré à: " + entry.getKey());
+                        return true;
                     }
+                } catch (Exception e) {
+                    warning("   ! Erreur station " + entry.getKey() + ": " + e.getMessage());
                 }
-            } catch (IOException e) {
-                // Connexion fermée
-            } finally {
-                closeConnection();
             }
-        }
+            return false;
+        }, executor);
 
-        private void closeConnection() {
-            try {
-                if (clientId != null) {
-                    activeConnections.remove(clientId);
-                }
-                socket.close();
-            } catch (IOException e) {
-                e.printStackTrace();
+        try {
+            // Attendre max 2 secondes
+            boolean result = future.get(2, TimeUnit.SECONDS);
+            if (!result) {
+                warning("   ⚠️  Aucune station disponible");
             }
-        }
-    }
-
-    private void handleSocketMessage(Message message, PrintWriter out) {
-        synchronized (productionLock) {
-            String response = "OK";
-
-            switch (message.getMessageType()) {
-                case Message.TYPE_STORAGE_ALERT:
-                    handleStorageAlert(message.getSenderId(), message.getContent());
-                    break;
-                case Message.TYPE_QUALITY_ISSUE:
-                    handleQualityIssue(message.getContent());
-                    break;
-                case Message.TYPE_STATUS:
-                    response = getSystemStatus();
-                    break;
-                default:
-                    response = "UNKNOWN_MESSAGE_TYPE";
-            }
-
-            out.println(response);
+            divider();
+            return result;
+        } catch (TimeoutException e) {
+            warning("   ⏱️  Timeout - Station bloquée?");
+            divider();
+            return false;
+        } catch (Exception e) {
+            error("   ✗ Erreur: " + e.getMessage());
+            divider();
+            return false;
         }
     }
 
-    public String handleMachineFailure(String machineId, String errorType) {
-        synchronized (productionLock) {
-            printDivider();
-            printWarning("⚠️  PANNE DÉTECTÉE");
-            System.out.println("   Machine: " + machineId);
-            System.out.println("   Erreur: " + errorType);
+    // === STATIONS ===
 
-            MachineInfo failedMachine = machineRegistry.get(machineId);
-            if (failedMachine == null) {
-                return "ERROR: Machine non enregistrée";
-            }
+    public boolean registerStation(String stationId, IStationCallback callback) {
+        stations.put(stationId, callback);
 
-            failedMachine.setStatus(MachineStatus.FAILED);
-            failedMachine.setLastError(errorType);
+        divider();
+        success("🏭 STATION ENREGISTRÉE");
+        info("   ID: " + stationId);
+        info("   Total stations: " + stations.size());
+        divider();
 
-            String replacementId = findReplacementMachine(failedMachine.getMachineType(), machineId);
-
-            if (replacementId != null) {
-                printInfo("   ✓ Solution: Remplacement par " + replacementId);
-                stopMachine(machineId);
-                startMachine(replacementId);
-                printDivider();
-                return "REPLACED_BY:" + replacementId;
-            } else {
-                printInfo("   ✗ Aucun remplacement disponible");
-                stopMachine(machineId);
-                printDivider();
-                return "NO_REPLACEMENT";
-            }
-        }
+        return true;
     }
 
-    private String findReplacementMachine(String machineType, String excludeMachineId) {
-        for (Map.Entry<String, MachineInfo> entry : machineRegistry.entrySet()) {
-            MachineInfo machine = entry.getValue();
-            if (machine.getMachineType().equals(machineType) &&
-                    !machine.getMachineId().equals(excludeMachineId) &&
-                    machine.getStatus() == MachineStatus.STOPPED) {
-                return machine.getMachineId();
-            }
-        }
-        return null;
-    }
-
-    public void handleStorageAlert(String zoneId, String levelStr) {
-        int level = Integer.parseInt(levelStr);
-        storageStatus.put(zoneId, level);
-
-        printDivider();
-        printWarning("📦 ALERTE STOCKAGE");
-        System.out.println("   Zone: " + zoneId);
-        System.out.println("   Niveau: " + level + "%");
+    public void handleStorageAlert(String zoneId, int level) {
+        divider();
+        warning("📦 ALERTE STOCKAGE");
+        info("   Zone: " + zoneId);
+        info("   Niveau: " + level + "%");
 
         if (level == 0) {
-            printInfo("   → Action: Démarrage production pour " + zoneId);
+            info("   → Action: Démarrer production " + zoneId);
             startProductionForZone(zoneId);
         } else if (level >= 100) {
-            printInfo("   → Action: Arrêt production pour " + zoneId);
+            info("   → Action: Arrêter production " + zoneId);
             stopProductionForZone(zoneId);
         }
-        printDivider();
+        divider();
     }
 
     private void startProductionForZone(String zoneId) {
-        for (MachineInfo machine : machineRegistry.values()) {
+        for (MachineInfo machine : machines.values()) {
             if (machine.getMachineType().equals(zoneId) &&
                     machine.getStatus() == MachineStatus.STOPPED) {
                 startMachine(machine.getMachineId());
@@ -236,7 +209,7 @@ public class ControlServer {
     }
 
     private void stopProductionForZone(String zoneId) {
-        for (MachineInfo machine : machineRegistry.values()) {
+        for (MachineInfo machine : machines.values()) {
             if (machine.getMachineType().equals(zoneId) &&
                     machine.getStatus() == MachineStatus.RUNNING) {
                 stopMachine(machine.getMachineId());
@@ -244,113 +217,103 @@ public class ControlServer {
         }
     }
 
-    public boolean startMachine(String machineId) {
-        MachineInfo machine = machineRegistry.get(machineId);
-        if (machine != null && machine.getStatus() != MachineStatus.FAILED) {
-            machine.setStatus(MachineStatus.RUNNING);
-            printSuccess("▶️  Machine " + machineId + " démarrée");
-            return true;
+    // === PANNES ===
+
+    public String handleFailure(String machineId, String errorType) {
+        divider();
+        warning("⚠️  PANNE MACHINE");
+        info("   ID: " + machineId);
+        info("   Erreur: " + errorType);
+
+        MachineInfo failed = machines.get(machineId);
+        if (failed == null) {
+            error("   ✗ Machine inconnue");
+            divider();
+            return "ERROR";
         }
-        return false;
-    }
 
-    public boolean stopMachine(String machineId) {
-        MachineInfo machine = machineRegistry.get(machineId);
-        if (machine != null) {
-            machine.setStatus(MachineStatus.STOPPED);
-            printSuccess("⏹️  Machine " + machineId + " arrêtée");
-            return true;
+        failed.setStatus(MachineStatus.FAILED);
+
+        String replacement = findReplacement(failed.getMachineType(), machineId);
+        if (replacement != null) {
+            info("   ✓ Remplacement: " + replacement);
+            stopMachine(machineId);
+            startMachine(replacement);
+            divider();
+            return "REPLACED_BY:" + replacement;
+        } else {
+            warning("   ! Pas de remplacement disponible");
+            stopMachine(machineId);
+            divider();
+            return "NO_REPLACEMENT";
         }
-        return false;
     }
 
-    private void handleQualityIssue(String details) {
-        printWarning("⚠️  PROBLÈME QUALITÉ: " + details);
-    }
-
-    private String getSystemStatus() {
-        StringBuilder status = new StringBuilder();
-        status.append("\n=== ÉTAT DU SYSTÈME ===\n");
-        status.append("Machines: ").append(machineRegistry.size()).append("\n");
-        for (MachineInfo machine : machineRegistry.values()) {
-            status.append("  - ").append(machine).append("\n");
-        }
-        return status.toString();
-    }
-
-    // Getters
-    public Map<String, MachineInfo> getMachineRegistry() { return machineRegistry; }
-    public Map<String, String> getAssemblyStationRegistry() { return assemblyStationRegistry; }
-    public Map<String, Integer> getStorageStatus() { return storageStatus; }
-
-    public void shutdown() {
-        try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
+    private String findReplacement(String type, String excludeId) {
+        for (Map.Entry<String, MachineInfo> entry : machines.entrySet()) {
+            MachineInfo m = entry.getValue();
+            if (m.getMachineType().equals(type) &&
+                    !m.getMachineId().equals(excludeId) &&
+                    m.getStatus() == MachineStatus.STOPPED) {
+                return m.getMachineId();
             }
-            threadPool.shutdown();
-            if (orb != null) {
-                orb.shutdown(false);
-            }
-            printSuccess("\n✓ Serveur arrêté proprement");
-        } catch (Exception e) {
-            e.printStackTrace();
         }
+        return null;
     }
 
-    // Méthodes d'affichage
-    private void printHeader(String title) {
-        System.out.println("\n╔═══════════════════════════════════════════════════╗");
-        System.out.println("║  " + centerText(title, 47) + "  ║");
-        System.out.println("╚═══════════════════════════════════════════════════╝");
+    // === STATUS ===
+
+    public String getSystemStatus() {
+        StringBuilder sb = new StringBuilder("\n");
+        sb.append("╔═══════════════════════════════════════════════════╗\n");
+        sb.append("║              ÉTAT DU SYSTÈME                     ║\n");
+        sb.append("╠═══════════════════════════════════════════════════╣\n");
+        sb.append("║ Machines: ").append(String.format("%-38d", machines.size())).append("║\n");
+        for (MachineInfo m : machines.values()) {
+            sb.append("║   ").append(String.format("%-45s", m.toString())).append("║\n");
+        }
+        sb.append("╠═══════════════════════════════════════════════════╣\n");
+        sb.append("║ Stations: ").append(String.format("%-38d", stations.size())).append("║\n");
+        for (String s : stations.keySet()) {
+            sb.append("║   ").append(String.format("%-45s", s)).append("║\n");
+        }
+        sb.append("╚═══════════════════════════════════════════════════╝\n");
+        return sb.toString();
     }
 
-    private void printDivider() {
-        System.out.println("───────────────────────────────────────────────────");
-    }
+    // === AFFICHAGE ===
 
-    private void printSuccess(String msg) {
-        System.out.println("✓ " + msg);
-    }
-
-    private void printWarning(String msg) {
-        System.out.println("\n" + msg);
-    }
-
-    private void printError(String msg) {
-        System.err.println("✗ " + msg);
-    }
-
-    private void printInfo(String msg) {
+    private void log(String msg) {
         System.out.println(msg);
     }
 
-    private String centerText(String text, int width) {
-        int padding = (width - text.length()) / 2;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < padding; i++) sb.append(" ");
-        sb.append(text);
-        while (sb.length() < width) sb.append(" ");
-        return sb.toString();
+    private void divider() {
+        System.out.println("───────────────────────────────────────────────────");
+    }
+
+    private void success(String msg) {
+        System.out.println("✓ " + msg);
+    }
+
+    private void warning(String msg) {
+        System.out.println("⚠️  " + msg);
+    }
+
+    private void error(String msg) {
+        System.err.println("✗ " + msg);
+    }
+
+    private void info(String msg) {
+        System.out.println(msg);
     }
 
     public static void main(String[] args) {
         ControlServer server = new ControlServer();
 
-        System.out.println("╔═══════════════════════════════════════════════════╗");
-        System.out.println("║     SYSTÈME DE CONTRÔLE DE PRODUCTION v2.0       ║");
-        System.out.println("╚═══════════════════════════════════════════════════╝");
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("\n✓ Arrêt du serveur");
+        }));
 
-        server.startCORBAServer(args);
-
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-
-        server.startSocketServer();
-
-        Runtime.getRuntime().addShutdownHook(new Thread(server::shutdown));
+        server.start(args);
     }
 }

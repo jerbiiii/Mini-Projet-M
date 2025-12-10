@@ -1,39 +1,34 @@
-// src/main/idl/ProductionControl.idl
 module ProductionControlModule {
 
-    // Interface pour le contrôle des machines de production
-    interface IProductionControl {
-        // Enregistrer une machine auprès du contrôleur
-        boolean registerMachine(in string machineId, in string machineType);
-
-        // Notifier le contrôleur d'une panne
-        string notifyFailure(in string machineId, in string errorType);
-
-        // Demander le démarrage de la production
-        boolean requestProductionStart(in string machineId);
-
-        // Demander l'arrêt de la production
-        boolean requestProductionStop(in string machineId);
-
-        // Notifier d'une alerte de stockage (vide ou plein)
-        void notifyStorageAlert(in string zoneId, in long level);
-
-        // Obtenir le statut d'une machine
-        string getMachineStatus(in string machineId);
+    // Structure pour représenter un composant
+    struct ComponentData {
+        string componentId;
+        string type;
+        string producedBy;
+        boolean isDefective;
     };
 
-    // Interface pour le contrôle de la station d'assemblage
-    interface IStationControl {
-        // Enregistrer une station d'assemblage
-        boolean registerAssemblyStation(in string stationId);
+    // Interface callback implémentée par la STATION (côté client)
+    interface IStationCallback {
+        boolean receiveComponent(in ComponentData comp);
+        string getStationId();
+    };
 
-        // Notifier d'un problème de qualité
-        void notifyQualityIssue(in string details);
+    // Interface principale du SERVEUR (côté serveur)
+    interface IProductionControl {
+        // === MACHINES ===
+        boolean registerMachine(in string machineId, in string machineType);
+        string notifyFailure(in string machineId, in string errorType);
+        boolean requestProductionStart(in string machineId);
+        boolean requestProductionStop(in string machineId);
+        boolean deliverComponent(in ComponentData comp);
+        string getMachineStatus(in string machineId);
 
-        // Demander une maintenance
-        boolean requestMaintenance(in string machineId);
+        // === STATIONS ===
+        boolean registerAssemblyStation(in string stationId, in IStationCallback callback);
+        void notifyStorageAlert(in string zoneId, in long level);
 
-        // Obtenir les commandes de production
-        string getProductionCommand(in string stationId);
+        // === STATUS ===
+        string getSystemStatus();
     };
 };

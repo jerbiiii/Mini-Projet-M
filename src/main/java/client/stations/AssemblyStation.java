@@ -1,442 +1,348 @@
 package client.stations;
 
 import common.Component;
-import common.Message;
 import common.Product;
 import org.omg.CORBA.ORB;
 import org.omg.CosNaming.NamingContextExt;
 import org.omg.CosNaming.NamingContextExtHelper;
-import ProductionControlModule.IStationControl;
-import ProductionControlModule.IStationControlHelper;
+import org.omg.PortableServer.POA;
+import org.omg.PortableServer.POAHelper;
+import ProductionControlModule.*;
 
-import java.io.*;
-import java.net.Socket;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.*;
 
-public class AssemblyStation implements Runnable {
+public class AssemblyStation {
     private String stationId;
-    private Socket socket;
-    private BufferedReader in;
-    private PrintWriter out;
-    private IStationControl stationControlRef;
+    private String[] types;
+    private Map<String, Queue<Component>> zones;
+    private IProductionControl controlRef;
+    private ORB orb;
 
-    private Map<String, Queue<Component>> storageZones;
     private int maxCapacity = 10;
     private int minCapacity = 2;
+    private int assembledCount = 0;
 
-    private int assembledProducts = 0;
+    // Thread séparé pour l'assemblage
+    private ScheduledExecutorService assemblyThread;
     private boolean isRunning = true;
-    private boolean simulationMode = false; // CORRECTION: Désactivé par défaut
 
-    private static final String SERVER_HOST = "localhost";
-    private static final int SOCKET_PORT = 5000;
-    private static final String CORBA_HOST = "localhost";
-    private static final int CORBA_PORT = 1050;
-
-    public AssemblyStation(String stationId, String[] componentTypes) {
+    public AssemblyStation(String stationId, String[] types) {
         this.stationId = stationId;
-        this.storageZones = new ConcurrentHashMap<>();
+        this.types = types;
+        this.zones = new ConcurrentHashMap<>();
 
-        for (String type : componentTypes) {
-            storageZones.put(type, new ConcurrentLinkedQueue<>());
+        for (String type : types) {
+            zones.put(type, new ConcurrentLinkedQueue<>());
         }
+
+        // Thread d'assemblage qui s'exécute toutes les 3 secondes
+        this.assemblyThread = Executors.newSingleThreadScheduledExecutor();
     }
 
-    public boolean connectToController() {
+    public boolean connect() {
         try {
-            printHeader("CONNEXION AU CONTRÔLEUR");
+            log("╔═══════════════════════════════════════════════════╗");
+            log("║          CONNEXION AU SERVEUR                    ║");
+            log("╚═══════════════════════════════════════════════════╝");
+            log("");
 
-            // Connexion CORBA
             Properties props = new Properties();
-            props.put("org.omg.CORBA.ORBInitialHost", CORBA_HOST);
-            props.put("org.omg.CORBA.ORBInitialPort", String.valueOf(CORBA_PORT));
+            props.put("org.omg.CORBA.ORBInitialPort", "1050");
+            props.put("org.omg.CORBA.ORBInitialHost", "localhost");
 
-            String[] args = new String[0];
-            ORB orb = ORB.init(args, props);
+            orb = ORB.init(new String[0], props);
 
+            POA rootPOA = POAHelper.narrow(orb.resolve_initial_references("RootPOA"));
+            rootPOA.the_POAManager().activate();
+
+            // Créer callback servant
+            StationCallbackServant servant = new StationCallbackServant();
+            org.omg.CORBA.Object ref = rootPOA.servant_to_reference(servant);
+            IStationCallback callback = IStationCallbackHelper.narrow(ref);
+
+            // Obtenir référence serveur
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
             NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+            controlRef = IProductionControlHelper.narrow(ncRef.resolve_str("ProductionControl"));
 
-            String name = "StationControl";
-            stationControlRef = IStationControlHelper.narrow(ncRef.resolve_str(name));
+            // S'enregistrer
+            if (controlRef.registerAssemblyStation(stationId, callback)) {
+                success("✓ Station enregistrée: " + stationId);
 
-            printSuccess("Connecté au service StationControl");
+                // Démarrer ORB dans un thread séparé (IMPORTANT!)
+                Thread orbThread = new Thread(() -> orb.run(), "ORB-Thread");
+                orbThread.setDaemon(true);
+                orbThread.start();
 
-            boolean registered = stationControlRef.registerAssemblyStation(stationId);
-            if (registered) {
-                printSuccess("Station " + stationId + " enregistrée");
+                // Démarrer l'assemblage automatique
+                startAssemblyLoop();
+
+                // Envoyer alertes initiales
+                checkLevelsAndAlert();
+
+                divider();
+                log("");
+                printStatus();
+                log("");
+                info("💡 Prêt à recevoir des composants\n");
+
+                return true;
             }
-
-            // Connexion Socket
-            socket = new Socket(SERVER_HOST, SOCKET_PORT);
-            in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            out = new PrintWriter(socket.getOutputStream(), true);
-
-            printSuccess("Connecté au serveur Socket");
-            printDivider();
-
-            return true;
+            return false;
 
         } catch (Exception e) {
-            printError("Erreur connexion: " + e.getMessage());
+            error("✗ ERREUR: " + e.getMessage());
+            info("  Vérifiez que le serveur est démarré");
             return false;
         }
     }
 
     /**
-     * CORRECTION: Ne vérifie les niveaux que s'il y a eu un changement
+     * Démarrer la boucle d'assemblage automatique
      */
-    public void checkStorageLevels() {
-        for (Map.Entry<String, Queue<Component>> entry : storageZones.entrySet()) {
+    private void startAssemblyLoop() {
+        assemblyThread.scheduleAtFixedRate(() -> {
+            try {
+                Product product = tryAssemble();
+                if (product != null) {
+                    divider();
+                    success("✅ PRODUIT ASSEMBLÉ: " + product.getProductId());
+                    info("   Composants utilisés: " + product.getComponents().size());
+                    divider();
+                    printStatus();
+                    checkLevelsAndAlert();
+                }
+            } catch (Exception e) {
+                // Ignorer les erreurs pour continuer
+            }
+        }, 3, 3, TimeUnit.SECONDS);
+    }
+
+    /**
+     * IMPORTANT: Méthode appelée par le serveur via CORBA
+     * Ne doit JAMAIS bloquer!
+     */
+    public synchronized boolean receiveComponent(Component comp) {
+        Queue<Component> zone = zones.get(comp.getType());
+
+        if (zone == null) {
+            warning("❌ Type inconnu: " + comp.getType());
+            return false;
+        }
+
+        if (zone.size() >= maxCapacity) {
+            warning("❌ Zone " + comp.getType() + " PLEINE - Rejeté");
+            return false;
+        }
+
+        zone.offer(comp);
+
+        divider();
+        success("📦 COMPOSANT REÇU");
+        info("   ID: " + comp.getComponentId());
+        info("   Type: " + comp.getType());
+        info("   De: " + comp.getProducedBy());
+        divider();
+        printStatus();
+
+        checkLevelsAndAlert();
+
+        return true;
+    }
+
+    private void checkLevelsAndAlert() {
+        for (Map.Entry<String, Queue<Component>> entry : zones.entrySet()) {
             String zoneId = entry.getKey();
             int level = entry.getValue().size();
 
-            // Alerte si zone vide
-            if (level == 0) {
-                printWarning("⚠️  Zone " + zoneId + " VIDE");
-                sendStorageAlert(zoneId, 0);
-            }
-            // Alerte si zone pleine
-            else if (level >= maxCapacity) {
-                printWarning("⚠️  Zone " + zoneId + " PLEINE (" + level + "/" + maxCapacity + ")");
-                sendStorageAlert(zoneId, 100);
-            }
-            // Alerte si niveau bas
-            else if (level <= minCapacity && level > 0) {
-                printWarning("⚠️  Zone " + zoneId + " NIVEAU BAS (" + level + "/" + maxCapacity + ")");
-                sendStorageAlert(zoneId, level * 10);
-            }
-        }
-    }
-
-    public void sendStorageAlert(String zoneId, int level) {
-        if (out != null) {
-            Message alert = new Message(Message.TYPE_STORAGE_ALERT, stationId,
-                    zoneId + ":" + level);
-            out.println(alert.serialize());
-
             try {
-                String response = in.readLine();
-                // Réponse reçue
-            } catch (IOException e) {
-                printError("Erreur lecture réponse: " + e.getMessage());
+                if (level == 0) {
+                    controlRef.notifyStorageAlert(zoneId, 0);
+                } else if (level >= maxCapacity) {
+                    controlRef.notifyStorageAlert(zoneId, 100);
+                } else if (level <= minCapacity) {
+                    controlRef.notifyStorageAlert(zoneId, level * 10);
+                }
+            } catch (Exception e) {
+                // Ignorer
             }
         }
     }
 
-    public boolean addComponent(Component component) {
-        Queue<Component> zone = storageZones.get(component.getType());
-        if (zone != null && zone.size() < maxCapacity) {
-            zone.offer(component);
-            printSuccess("📦 Composant reçu: " + component.getComponentId() +
-                    " (Type: " + component.getType() + ")");
-            displayStorageStatus();
-
-            // Vérifier les niveaux après ajout
-            checkStorageLevels();
-            return true;
-        } else if (zone != null && zone.size() >= maxCapacity) {
-            printWarning("❌ Zone " + component.getType() + " pleine! Composant rejeté.");
-            return false;
-        }
-        return false;
-    }
-
-    public Product assembleProduct() {
-        // Vérifier si on a au moins un composant de chaque type
-        for (Queue<Component> zone : storageZones.values()) {
+    private synchronized Product tryAssemble() {
+        // Vérifier qu'on a au moins un de chaque type
+        for (Queue<Component> zone : zones.values()) {
             if (zone.isEmpty()) {
                 return null;
             }
         }
 
-        // Créer un nouveau produit
-        String productId = stationId + "-P" + (++assembledProducts);
-        Product product = new Product(productId, storageZones.size());
+        String productId = stationId + "-P" + (++assembledCount);
+        Product product = new Product(productId, zones.size());
 
-        // Prélever un composant de chaque zone
-        for (Queue<Component> zone : storageZones.values()) {
-            Component component = zone.poll();
-            if (component != null) {
-                product.addComponent(component);
+        for (Queue<Component> zone : zones.values()) {
+            Component comp = zone.poll();
+            if (comp != null) {
+                product.addComponent(comp);
             }
         }
 
         return product;
     }
 
-    /**
-     * CORRECTION: Simulation désactivée par défaut
-     */
-    private void simulateComponentReception() {
-        if (!simulationMode) {
-            return; // Ne rien faire si mode simulation désactivé
-        }
+    private void printStatus() {
+        log("┌─────────────────────────────────────────────────┐");
+        log("│           ZONES DE STOCKAGE                     │");
+        log("├─────────────────────────────────────────────────┤");
 
-        Random random = new Random();
-        int count = 0;
-
-        for (String type : storageZones.keySet()) {
-            if (random.nextInt(100) < 30) {
-                Component component = new Component("SIM-" + (++count), type, "SIMULATED");
-                addComponent(component);
-            }
-        }
-    }
-
-    @Override
-    public void run() {
-        printHeader("STATION " + stationId + " OPÉRATIONNELLE");
-        System.out.println("Zones de stockage: " + storageZones.keySet());
-        System.out.println("Capacité max par zone: " + maxCapacity);
-        printDivider();
-
-        // CORRECTION: Envoyer les alertes initiales pour zones vides
-        printInfo("📊 État initial:");
-        displayStorageStatus();
-        printInfo("\n💡 En attente de composants des machines...\n");
-        checkStorageLevels();
-
-        int cycleCount = 0;
-
-        while (isRunning) {
-            try {
-                cycleCount++;
-
-                // CORRECTION: Simulation désactivée par défaut
-                if (simulationMode) {
-                    simulateComponentReception();
-                }
-
-                // Tenter d'assembler un produit
-                Product product = assembleProduct();
-                if (product != null) {
-                    printDivider();
-                    printSuccess("✅ PRODUIT ASSEMBLÉ: " + product.getProductId());
-                    printInfo("   Composants: " + product.getComponents().size());
-                    printDivider();
-                    displayStorageStatus();
-
-                    // Vérifier les niveaux après assemblage
-                    checkStorageLevels();
-                }
-
-                // Afficher le statut toutes les 5 itérations seulement si pas en simulation
-                if (!simulationMode && cycleCount % 5 == 0) {
-                    displayStorageStatus();
-                }
-
-                // Attendre avant la prochaine itération
-                Thread.sleep(3000);
-
-            } catch (InterruptedException e) {
-                printWarning("Station interrompue");
-                break;
-            } catch (Exception e) {
-                printError("Erreur station: " + e.getMessage());
-                e.printStackTrace();
-            }
-        }
-
-        printDivider();
-        printInfo("🏁 Station " + stationId + " arrêtée");
-        printInfo("📊 Total assemblé: " + assembledProducts + " produits");
-        printDivider();
-    }
-
-    private void displayStorageStatus() {
-        System.out.println("\n┌─────────────────────────────────────────────────┐");
-        System.out.println("│         ÉTAT DES ZONES DE STOCKAGE              │");
-        System.out.println("├─────────────────────────────────────────────────┤");
-
-        for (Map.Entry<String, Queue<Component>> entry : storageZones.entrySet()) {
+        for (Map.Entry<String, Queue<Component>> entry : zones.entrySet()) {
             int level = entry.getValue().size();
-            String bar = generateBar(level, maxCapacity);
-            String status = getStatusIcon(level);
+            String icon = getIcon(level);
+            String bar = generateBar(level);
+            String name = String.format("%-10s", entry.getKey());
+            String count = String.format("%2d/%2d", level, maxCapacity);
 
-            String zoneName = String.format("%-10s", entry.getKey());
-            String levelStr = String.format("%2d/%2d", level, maxCapacity);
-
-            System.out.println("│ " + status + " " + zoneName + " " + bar + " " + levelStr + "   │");
+            log(String.format("│ %s %s %s %s  │", icon, name, bar, count));
         }
 
-        System.out.println("├─────────────────────────────────────────────────┤");
-        System.out.println("│ 🏭 Produits assemblés: " + String.format("%-22d", assembledProducts) + " │");
-        System.out.println("└─────────────────────────────────────────────────┘");
+        log("├─────────────────────────────────────────────────┤");
+        log(String.format("│ 🏭 Produits assemblés: %-23d │", assembledCount));
+        log("└─────────────────────────────────────────────────┘");
     }
 
-    private String getStatusIcon(int level) {
+    private String getIcon(int level) {
         if (level == 0) return "🔴";
-        if (level <= minCapacity) return "🟡";
         if (level >= maxCapacity) return "🔴";
+        if (level <= minCapacity) return "🟡";
         return "🟢";
     }
 
-    private String generateBar(int current, int max) {
-        int bars = (current * 20) / max;
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < 20; i++) {
-            if (i < bars) {
-                sb.append("█");
-            } else {
-                sb.append("░");
-            }
+    private String generateBar(int level) {
+        int filled = (level * 15) / maxCapacity;
+        StringBuilder bar = new StringBuilder("[");
+        for (int i = 0; i < 15; i++) {
+            bar.append(i < filled ? "█" : "░");
         }
-        sb.append("]");
-        return sb.toString();
+        bar.append("]");
+        return bar.toString();
     }
 
     public void shutdown() {
         isRunning = false;
-        try {
-            if (socket != null && !socket.isClosed()) {
-                socket.close();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        assemblyThread.shutdown();
+        if (orb != null) {
+            orb.shutdown(false);
         }
     }
 
-    public void toggleSimulationMode() {
-        simulationMode = !simulationMode;
-        if (simulationMode) {
-            printInfo("🔄 Mode simulation ACTIVÉ");
-        } else {
-            printInfo("🔄 Mode simulation DÉSACTIVÉ");
+    /**
+     * Servant CORBA pour recevoir les callbacks du serveur
+     */
+    private class StationCallbackServant extends IStationCallbackPOA {
+        @Override
+        public boolean receiveComponent(ComponentData data) {
+            Component comp = new Component(data.componentId, data.type, data.producedBy);
+            comp.setDefective(data.isDefective);
+            return AssemblyStation.this.receiveComponent(comp);
+        }
+
+        @Override
+        public String getStationId() {
+            return stationId;
         }
     }
 
-    // Méthodes d'affichage
-    private void printHeader(String title) {
-        System.out.println("\n╔═══════════════════════════════════════════════════╗");
-        System.out.println("║  " + centerText(title, 47) + "  ║");
-        System.out.println("╚═══════════════════════════════════════════════════╝");
+    // === AFFICHAGE ===
+
+    private void log(String msg) {
+        System.out.println(msg);
     }
 
-    private void printDivider() {
+    private void divider() {
         System.out.println("───────────────────────────────────────────────────");
     }
 
-
-
-    private void printWarning(String msg) {
-        System.out.println(msg);
+    private void success(String msg) {
+        System.out.println("✓ " + msg);
     }
 
-    private void printError(String msg) {
+    private void warning(String msg) {
+        System.out.println("⚠️  " + msg);
+    }
+
+    private void error(String msg) {
         System.err.println("✗ " + msg);
     }
 
-    private void printInfo(String msg) {
+    private void info(String msg) {
         System.out.println(msg);
     }
 
-    private String centerText(String text, int width) {
-        int padding = (width - text.length()) / 2;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < padding; i++) sb.append(" ");
-        sb.append(text);
-        while (sb.length() < width) sb.append(" ");
-        return sb.toString();
-    }
+    // === MAIN ===
 
     public static void main(String[] args) {
-        Scanner scanner = new Scanner(System.in);
+        Scanner sc = new Scanner(System.in);
 
         System.out.println("╔═══════════════════════════════════════════════════╗");
-        System.out.println("║      CONFIGURATION STATION D'ASSEMBLAGE          ║");
-        System.out.println("╚═══════════════════════════════════════════════════╝\n");
+        System.out.println("║       CONFIGURATION STATION D'ASSEMBLAGE         ║");
+        System.out.println("╚═══════════════════════════════════════════════════╝");
+        System.out.println();
 
         System.out.print("ID Station (ex: STATION1): ");
-        String stationId = scanner.nextLine();
+        String id = sc.nextLine().trim();
 
-        System.out.print("Types de composants (séparés par virgule, ex: TYPE_A,TYPE_B): ");
-        String typesStr = scanner.nextLine();
+        System.out.print("Types de composants (ex: TYPE_A,TYPE_B): ");
+        String typesStr = sc.nextLine().trim();
         String[] types = typesStr.split(",");
-
         for (int i = 0; i < types.length; i++) {
             types[i] = types[i].trim();
         }
 
-        AssemblyStation station = new AssemblyStation(stationId, types);
+        AssemblyStation station = new AssemblyStation(id, types);
 
-        if (!station.connectToController()) {
-            System.err.println("❌ Impossible de se connecter au contrôleur");
-            System.err.println("💡 Assurez-vous que le serveur est démarré");
-            return;
+        if (!station.connect()) {
+            System.exit(1);
         }
 
-        Thread stationThread = new Thread(station);
-        stationThread.start();
-
+        // Menu interactif
         System.out.println("\n╔═══════════════════════════════════════════════════╗");
-        System.out.println("║           MENU STATION " + stationId + "                    ║");
+        System.out.println("║                MENU STATION                      ║");
         System.out.println("╠═══════════════════════════════════════════════════╣");
-        System.out.println("║  1. 📊 Afficher statut                            ║");
-        System.out.println("║  2. 📦 Ajouter composant manuellement             ║");
-        System.out.println("║  3. 🔧 Assembler produit                          ║");
-        System.out.println("║  4. 🔄 Activer/désactiver mode simulation         ║");
-        System.out.println("║  5. 🚪 Quitter                                     ║");
-        System.out.println("╚═══════════════════════════════════════════════════╝\n");
+        System.out.println("║  1. Afficher état                                ║");
+        System.out.println("║  2. Forcer assemblage                            ║");
+        System.out.println("║  3. Quitter                                      ║");
+        System.out.println("╚═══════════════════════════════════════════════════╝");
+        System.out.println();
 
-        boolean quit = false;
-        while (!quit) {
-            System.out.print("Choix: ");
-            String choice = scanner.nextLine();
+        while (station.isRunning) {
+            System.out.print(id + " > ");
+            String choice = sc.nextLine().trim();
 
             switch (choice) {
                 case "1":
-                    station.displayStorageStatus();
+                    station.printStatus();
                     break;
 
                 case "2":
-                    System.out.print("Type de composant (" + String.join(", ", types) + "): ");
-                    String type = scanner.nextLine().trim();
-                    if (station.storageZones.containsKey(type)) {
-                        Component comp = new Component("MANUAL-" + System.currentTimeMillis(),
-                                type, "MANUAL");
-                        if (station.addComponent(comp)) {
-                            printSuccess("✓ Composant ajouté");
-                        } else {
-                            System.out.println("✗ Zone pleine");
-                        }
+                    Product p = station.tryAssemble();
+                    if (p != null) {
+                        System.out.println("✓ Produit assemblé: " + p.getProductId());
+                        station.printStatus();
                     } else {
-                        System.out.println("❌ Type invalide");
+                        System.out.println("✗ Composants manquants");
                     }
                     break;
 
                 case "3":
-                    Product product = station.assembleProduct();
-                    if (product != null) {
-                        printSuccess("✓ Produit assemblé: " + product.getProductId());
-                        station.displayStorageStatus();
-                    } else {
-                        System.out.println("❌ Composants insuffisants");
-                    }
-                    break;
-
-                case "4":
-                    station.toggleSimulationMode();
-                    break;
-
-                case "5":
+                    System.out.println("\n👋 Arrêt de la station " + id);
                     station.shutdown();
-                    quit = true;
-                    System.out.println("\n👋 Arrêt de la station " + stationId);
+                    System.exit(0);
                     break;
 
                 default:
-                    System.out.println("❌ Choix invalide");
+                    System.out.println("❌ Commande invalide (1, 2 ou 3)");
             }
         }
-
-        scanner.close();
-        System.exit(0);
-    }
-
-    private static void printSuccess(String msg) {
-        System.out.println("✓ " + msg);
     }
 }

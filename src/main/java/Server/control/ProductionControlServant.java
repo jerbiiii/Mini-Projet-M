@@ -1,67 +1,67 @@
 package Server.control;
 
-import common.MachineInfo;
-import common.MachineInfo.MachineStatus;
-import ProductionControlModule.IProductionControlPOA;
+import common.Component;
+import ProductionControlModule.*;
 
 /**
- * Implémentation CORBA de l'interface IProductionControl
- * Gère les machines de production
+ * Servant CORBA - Délègue tout au ControlServer
  */
 public class ProductionControlServant extends IProductionControlPOA {
 
-    private ControlServer controlServer;
+    private ControlServer server;
 
-    public ProductionControlServant(ControlServer controlServer) {
-        this.controlServer = controlServer;
+    public ProductionControlServant(ControlServer server) {
+        this.server = server;
     }
 
     @Override
     public boolean registerMachine(String machineId, String machineType) {
-        System.out.println("\n[CORBA] Enregistrement machine: " + machineId +
-                " (Type: " + machineType + ")");
-
-        MachineInfo machineInfo = new MachineInfo(machineId, machineType);
-        controlServer.getMachineRegistry().put(machineId, machineInfo);
-
-        System.out.println("✓ Machine " + machineId + " enregistrée avec succès");
-        return true;
+        return server.registerMachine(machineId, machineType);
     }
 
     @Override
     public String notifyFailure(String machineId, String errorType) {
-        System.out.println("\n[CORBA] Notification de panne: " + machineId +
-                " - Erreur: " + errorType);
-
-        String result = controlServer.handleMachineFailure(machineId, errorType);
-        return result;
+        return server.handleFailure(machineId, errorType);
     }
 
     @Override
     public boolean requestProductionStart(String machineId) {
-        System.out.println("\n[CORBA] Demande de démarrage: " + machineId);
-        return controlServer.startMachine(machineId);
+        return server.startMachine(machineId);
     }
 
     @Override
     public boolean requestProductionStop(String machineId) {
-        System.out.println("\n[CORBA] Demande d'arrêt: " + machineId);
-        return controlServer.stopMachine(machineId);
+        return server.stopMachine(machineId);
     }
 
     @Override
-    public void notifyStorageAlert(String zoneId, int level) {
-        System.out.println("\n[CORBA] Alerte stockage: Zone " + zoneId +
-                " - Niveau: " + level);
-        controlServer.handleStorageAlert(zoneId, String.valueOf(level));
+    public boolean deliverComponent(ComponentData compData) {
+        Component comp = new Component(
+                compData.componentId,
+                compData.type,
+                compData.producedBy
+        );
+        comp.setDefective(compData.isDefective);
+        return server.deliverComponent(comp);
     }
 
     @Override
     public String getMachineStatus(String machineId) {
-        MachineInfo machine = controlServer.getMachineRegistry().get(machineId);
-        if (machine != null) {
-            return machine.getStatus().toString();
-        }
-        return "UNKNOWN";
+        return server.getMachineStatus(machineId);
+    }
+
+    @Override
+    public boolean registerAssemblyStation(String stationId, IStationCallback callback) {
+        return server.registerStation(stationId, callback);
+    }
+
+    @Override
+    public void notifyStorageAlert(String zoneId, int level) {
+        server.handleStorageAlert(zoneId, level);
+    }
+
+    @Override
+    public String getSystemStatus() {
+        return server.getSystemStatus();
     }
 }

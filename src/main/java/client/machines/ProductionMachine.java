@@ -11,22 +11,18 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.Scanner;
 
-/**
- * Machine de production (Client CORBA)
- * Communique avec le contrôleur via CORBA
- */
 public class ProductionMachine implements Runnable {
-
     private String machineId;
     private String machineType;
     private IProductionControl controlRef;
-    private int productionRate; // millisecondes entre productions
+    private int productionRate;
     private boolean isRunning;
     private boolean shouldStop;
     private int productionCount;
     private Random random;
+    private long lastStatusCheck;
+    private static final long STATUS_CHECK_INTERVAL = 2000; // Vérifier toutes les 2 secondes
 
-    // Configuration CORBA
     private static final String CORBA_HOST = "localhost";
     private static final int CORBA_PORT = 1050;
 
@@ -38,16 +34,13 @@ public class ProductionMachine implements Runnable {
         this.shouldStop = false;
         this.productionCount = 0;
         this.random = new Random();
+        this.lastStatusCheck = System.currentTimeMillis();
     }
 
-    /**
-     * Connexion au contrôleur via CORBA
-     */
     public boolean connectToController() {
         try {
-            System.out.println("\n=== Connexion au contrôleur CORBA ===");
+            printHeader("CONNEXION AU CONTRÔLEUR");
 
-            // Créer et initialiser l'ORB
             Properties props = new Properties();
             props.put("org.omg.CORBA.ORBInitialHost", CORBA_HOST);
             props.put("org.omg.CORBA.ORBInitialPort", String.valueOf(CORBA_PORT));
@@ -55,84 +48,113 @@ public class ProductionMachine implements Runnable {
             String[] args = new String[0];
             ORB orb = ORB.init(args, props);
 
-            // Obtenir le contexte de nommage
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
             NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
 
-            // Obtenir la référence au service ProductionControl
             String name = "ProductionControl";
             controlRef = IProductionControlHelper.narrow(ncRef.resolve_str(name));
 
-            System.out.println("✓ Connecté au service ProductionControl");
+            printSuccess("Connecté au service ProductionControl");
 
-            // Enregistrer la machine auprès du contrôleur
             boolean registered = controlRef.registerMachine(machineId, machineType);
             if (registered) {
-                System.out.println("✓ Machine " + machineId + " enregistrée avec succès");
+                printSuccess("Machine " + machineId + " enregistrée");
+                printDivider();
                 return true;
             } else {
-                System.err.println("✗ Échec de l'enregistrement");
+                printError("Échec de l'enregistrement");
                 return false;
             }
 
         } catch (Exception e) {
-            System.err.println("✗ Erreur de connexion CORBA: " + e.getMessage());
-            e.printStackTrace();
+            printError("Erreur connexion CORBA: " + e.getMessage());
             return false;
         }
     }
 
     /**
-     * Démarrer la production
+     * CORRECTION: Vérifier le statut côté serveur périodiquement
      */
+    private void checkServerStatus() {
+        long now = System.currentTimeMillis();
+        if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL) {
+            try {
+                String serverStatus = controlRef.getMachineStatus(machineId);
+
+                // Synchroniser avec le serveur
+                if ("RUNNING".equals(serverStatus) && !isRunning) {
+                    isRunning = true;
+                    printInfo("🔄 Synchronisation: Production activée par le serveur");
+                } else if ("STOPPED".equals(serverStatus) && isRunning) {
+                    isRunning = false;
+                    printInfo("🔄 Synchronisation: Production arrêtée par le serveur");
+                } else if ("FAILED".equals(serverStatus)) {
+                    isRunning = false;
+                    printWarning("⚠️  Machine en panne - Arrêt forcé");
+                }
+
+                lastStatusCheck = now;
+            } catch (Exception e) {
+                printError("Erreur vérification statut: " + e.getMessage());
+            }
+        }
+    }
+
     public void startProduction() {
         if (controlRef != null) {
-            boolean started = controlRef.requestProductionStart(machineId);
-            if (started) {
-                isRunning = true;
-                System.out.println("\n✓ Production démarrée pour " + machineId);
+            try {
+                boolean started = controlRef.requestProductionStart(machineId);
+                if (started) {
+                    isRunning = true;
+                    printSuccess("▶️  Production démarrée");
+                } else {
+                    printError("Impossible de démarrer la production");
+                }
+            } catch (Exception e) {
+                printError("Erreur démarrage: " + e.getMessage());
             }
         }
     }
 
-    /**
-     * Arrêter la production
-     */
     public void stopProduction() {
         if (controlRef != null) {
-            boolean stopped = controlRef.requestProductionStop(machineId);
-            if (stopped) {
-                isRunning = false;
-                System.out.println("\n✓ Production arrêtée pour " + machineId);
+            try {
+                boolean stopped = controlRef.requestProductionStop(machineId);
+                if (stopped) {
+                    isRunning = false;
+                    printSuccess("⏹️  Production arrêtée");
+                } else {
+                    printError("Impossible d'arrêter la production");
+                }
+            } catch (Exception e) {
+                printError("Erreur arrêt: " + e.getMessage());
             }
         }
     }
 
-    /**
-     * Simuler une panne
-     */
     public void simulateFailure(String errorType) {
         if (controlRef != null) {
-            System.out.println("\n⚠ SIMULATION DE PANNE: " + errorType);
-            String response = controlRef.notifyFailure(machineId, errorType);
-            System.out.println("→ Réponse du contrôleur: " + response);
+            try {
+                printWarning("\n⚠️  SIMULATION DE PANNE: " + errorType);
+                String response = controlRef.notifyFailure(machineId, errorType);
+                printInfo("→ Réponse du contrôleur: " + response);
 
-            if (response.startsWith("REPLACED_BY:")) {
-                String replacementId = response.substring("REPLACED_BY:".length());
-                System.out.println("→ Remplacé par: " + replacementId);
-                isRunning = false;
+                if (response.startsWith("REPLACED_BY:")) {
+                    String replacementId = response.substring("REPLACED_BY:".length());
+                    printInfo("→ Remplacé par: " + replacementId);
+                    isRunning = false;
+                    shouldStop = true;
+                }
+            } catch (Exception e) {
+                printError("Erreur notification panne: " + e.getMessage());
             }
         }
     }
 
-    /**
-     * Produire un composant
-     */
     public Component produceComponent() {
         String componentId = machineId + "-C" + (++productionCount);
         Component component = new Component(componentId, machineType, machineId);
 
-        // Simuler un défaut aléatoire (5% de chance)
         if (random.nextInt(100) < 5) {
             component.setDefective(true);
         }
@@ -140,95 +162,134 @@ public class ProductionMachine implements Runnable {
         return component;
     }
 
-    /**
-     * Boucle de production principale
-     */
     @Override
     public void run() {
-        System.out.println("\n" + machineId + " prêt à produire (Type: " + machineType + ")");
+        printHeader("MACHINE " + machineId + " OPÉRATIONNELLE");
+        System.out.println("Type: " + machineType);
+        System.out.println("Taux de production: " + productionRate + "ms");
+        printDivider();
+        printInfo("💡 En attente de commandes...\n");
 
         while (!shouldStop) {
+            // CORRECTION: Vérifier le statut côté serveur
+            checkServerStatus();
+
             if (isRunning) {
                 try {
-                    // Produire un composant
                     Component component = produceComponent();
-                    System.out.println(machineId + " → Produit: " + component);
+                    printSuccess("🔧 Produit [" + productionCount + "]: " + component.getComponentId());
 
                     // Simuler une panne aléatoire (2% de chance)
                     if (random.nextInt(100) < 2) {
                         simulateFailure("MECHANICAL_FAILURE");
                     }
 
-                    // Attendre selon le taux de production
                     Thread.sleep(productionRate);
 
                 } catch (InterruptedException e) {
-                    System.err.println("Production interrompue");
+                    printWarning("Production interrompue");
                     break;
                 } catch (Exception e) {
-                    System.err.println("Erreur de production: " + e.getMessage());
+                    printError("Erreur de production: " + e.getMessage());
                 }
             } else {
                 // Machine arrêtée, attendre
                 try {
-                    Thread.sleep(1000);
+                    Thread.sleep(500);
                 } catch (InterruptedException e) {
                     break;
                 }
             }
         }
 
-        System.out.println(machineId + " arrêté. Total produit: " + productionCount);
+        printDivider();
+        printInfo("🏁 Machine " + machineId + " arrêtée");
+        printInfo("📊 Total produit: " + productionCount + " composants");
+        printDivider();
     }
 
-    /**
-     * Arrêter la machine
-     */
     public void shutdown() {
         shouldStop = true;
         isRunning = false;
     }
 
-    /**
-     * Main - Menu interactif pour la machine
-     */
+    // Méthodes d'affichage
+    private void printHeader(String title) {
+        System.out.println("\n╔═══════════════════════════════════════════════════╗");
+        System.out.println("║  " + centerText(title, 47) + "  ║");
+        System.out.println("╚═══════════════════════════════════════════════════╝");
+    }
+
+    private void printDivider() {
+        System.out.println("───────────────────────────────────────────────────");
+    }
+
+    private void printSuccess(String msg) {
+        System.out.println("✓ " + msg);
+    }
+
+    private void printWarning(String msg) {
+        System.out.println(msg);
+    }
+
+    private void printError(String msg) {
+        System.err.println("✗ " + msg);
+    }
+
+    private void printInfo(String msg) {
+        System.out.println(msg);
+    }
+
+    private String centerText(String text, int width) {
+        int padding = (width - text.length()) / 2;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < padding; i++) sb.append(" ");
+        sb.append(text);
+        while (sb.length() < width) sb.append(" ");
+        return sb.toString();
+    }
+
     public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
 
-        System.out.println("=== Configuration Machine de Production ===");
+        System.out.println("╔═══════════════════════════════════════════════════╗");
+        System.out.println("║      CONFIGURATION MACHINE DE PRODUCTION         ║");
+        System.out.println("╚═══════════════════════════════════════════════════╝\n");
+
         System.out.print("ID Machine (ex: M1): ");
         String machineId = scanner.nextLine();
 
-        System.out.print("Type Machine (ex: TYPE_A, TYPE_B): ");
+        System.out.print("Type Machine (ex: TYPE_A): ");
         String machineType = scanner.nextLine();
 
-        System.out.print("Taux de production (ms, ex: 3000): ");
+        System.out.print("Taux de production en ms (ex: 3000): ");
         int rate = scanner.nextInt();
-        scanner.nextLine(); // consommer le \n
+        scanner.nextLine();
 
         ProductionMachine machine = new ProductionMachine(machineId, machineType, rate);
 
-        // Connexion au contrôleur
         if (!machine.connectToController()) {
-            System.err.println("Impossible de se connecter au contrôleur");
+            System.err.println("❌ Impossible de se connecter au contrôleur");
+            System.err.println("💡 Assurez-vous que le serveur est démarré");
             return;
         }
 
-        // Démarrer le thread de production
         Thread machineThread = new Thread(machine);
         machineThread.start();
 
-        // Menu interactif
-        System.out.println("\n=== Menu Machine " + machineId + " ===");
-        System.out.println("1. Démarrer production");
-        System.out.println("2. Arrêter production");
-        System.out.println("3. Simuler panne");
-        System.out.println("4. Afficher statut");
-        System.out.println("5. Quitter");
+        System.out.println("\n╔═══════════════════════════════════════════════════╗");
+        System.out.println("║              MENU MACHINE " + machineId + "                    ║");
+        System.out.println("╠═══════════════════════════════════════════════════╣");
+        System.out.println("║  1. ▶️  Démarrer production                        ║");
+        System.out.println("║  2. ⏹️  Arrêter production                         ║");
+        System.out.println("║  3. ⚠️  Simuler panne                             ║");
+        System.out.println("║  4. 📊 Afficher statut                            ║");
+        System.out.println("║  5. 🚪 Quitter                                     ║");
+        System.out.println("╚═══════════════════════════════════════════════════╝\n");
 
         boolean quit = false;
         while (!quit) {
-            System.out.print("\nChoix: ");
+            System.out.print("Choix: ");
             String choice = scanner.nextLine();
 
             switch (choice) {
@@ -241,28 +302,32 @@ public class ProductionMachine implements Runnable {
                     break;
 
                 case "3":
-                    System.out.print("Type d'erreur (ex: MECHANICAL_FAILURE): ");
+                    System.out.print("Type d'erreur (MECHANICAL_FAILURE, OVERHEATING, etc.): ");
                     String errorType = scanner.nextLine();
                     machine.simulateFailure(errorType);
                     break;
 
                 case "4":
-                    System.out.println("\nStatut: " + (machine.isRunning ? "EN MARCHE" : "ARRÊTÉE"));
-                    System.out.println("Production: " + machine.productionCount + " composants");
+                    System.out.println("\n╔═══════════════════════════════════════════════════╗");
+                    System.out.println("║               STATUT MACHINE " + machineId + "                 ║");
+                    System.out.println("╠═══════════════════════════════════════════════════╣");
+                    System.out.println("║  État: " + (machine.isRunning ? "🟢 EN MARCHE       " : "🔴 ARRÊTÉE        ") + "                     ║");
+                    System.out.println("║  Production: " + machine.productionCount + " composants                    ║");
+                    System.out.println("╚═══════════════════════════════════════════════════╝");
                     break;
 
                 case "5":
                     machine.shutdown();
                     quit = true;
+                    System.out.println("\n👋 Arrêt de la machine " + machineId);
                     break;
 
                 default:
-                    System.out.println("Choix invalide");
+                    System.out.println("❌ Choix invalide");
             }
         }
 
         scanner.close();
-        System.out.println("Machine " + machineId + " terminée");
         System.exit(0);
     }
 }

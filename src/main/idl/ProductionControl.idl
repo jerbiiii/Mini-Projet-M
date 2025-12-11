@@ -1,6 +1,6 @@
 module ProductionControlModule {
 
-    // Structure pour représenter un composant
+    // Structure pour les données de composant
     struct ComponentData {
         string componentId;
         string type;
@@ -8,27 +8,30 @@ module ProductionControlModule {
         boolean isDefective;
     };
 
-    // Interface callback implémentée par la STATION (côté client)
+    // Interface callback pour les stations d'assemblage
     interface IStationCallback {
-        boolean receiveComponent(in ComponentData comp);
+        boolean receiveComponent(in ComponentData data);
         string getStationId();
     };
 
-    // Interface principale du SERVEUR (côté serveur)
+    // Interface principale du contrôleur de production
     interface IProductionControl {
-        // === MACHINES ===
+        // Gestion des machines
         boolean registerMachine(in string machineId, in string machineType);
         string notifyFailure(in string machineId, in string errorType);
+        boolean notifyRepair(in string machineId);  // NOUVEAU
         boolean requestProductionStart(in string machineId);
         boolean requestProductionStop(in string machineId);
-        boolean deliverComponent(in ComponentData comp);
         string getMachineStatus(in string machineId);
 
-        // === STATIONS ===
+        // Gestion des composants
+        boolean deliverComponent(in ComponentData compData);
+
+        // Gestion des stations
         boolean registerAssemblyStation(in string stationId, in IStationCallback callback);
         void notifyStorageAlert(in string zoneId, in long level);
 
-        // === STATUS ===
+        // Monitoring
         string getSystemStatus();
     };
 };

@@ -12,6 +12,11 @@ import ProductionControlModule.*;
 import java.util.*;
 import java.util.concurrent.*;
 
+/**
+ * Station d'Assemblage - Version Automatique Améliorée
+ * Surveillance CONTINUE des niveaux de stockage
+ * Alertes périodiques au serveur jusqu'à résolution
+ */
 public class AssemblyStation {
     private String stationId;
     private String[] types;
@@ -23,9 +28,11 @@ public class AssemblyStation {
     private int minCapacity = 2;
     private int assembledCount = 0;
 
-    // Thread séparé pour l'assemblage
+    // Thread séparé pour l'assemblage automatique
     private ScheduledExecutorService assemblyThread;
-    private boolean isRunning = true;
+    // Thread pour surveillance CONTINUE des niveaux
+    private ScheduledExecutorService monitoringThread;
+    private volatile boolean isRunning = true;
 
     public AssemblyStation(String stationId, String[] types) {
         this.stationId = stationId;
@@ -36,8 +43,8 @@ public class AssemblyStation {
             zones.put(type, new ConcurrentLinkedQueue<>());
         }
 
-        // Thread d'assemblage qui s'exécute toutes les 3 secondes
         this.assemblyThread = Executors.newSingleThreadScheduledExecutor();
+        this.monitoringThread = Executors.newSingleThreadScheduledExecutor();
     }
 
     public boolean connect() {
@@ -70,7 +77,7 @@ public class AssemblyStation {
             if (controlRef.registerAssemblyStation(stationId, callback)) {
                 success("✓ Station enregistrée: " + stationId);
 
-                // Démarrer ORB dans un thread séparé (IMPORTANT!)
+                // Démarrer ORB dans un thread séparé
                 Thread orbThread = new Thread(() -> orb.run(), "ORB-Thread");
                 orbThread.setDaemon(true);
                 orbThread.start();
@@ -78,14 +85,17 @@ public class AssemblyStation {
                 // Démarrer l'assemblage automatique
                 startAssemblyLoop();
 
-                // Envoyer alertes initiales
-                checkLevelsAndAlert();
+                // NOUVEAU : Surveillance CONTINUE des niveaux (toutes les 5 secondes)
+                startContinuousMonitoring();
 
                 divider();
                 log("");
                 printStatus();
                 log("");
-                info("💡 Prêt à recevoir des composants\n");
+                info("💡 Station en mode automatique");
+                info("   Assemblage: toutes les 3 secondes");
+                info("   Surveillance: toutes les 5 secondes");
+                info("   Prêt à recevoir des composants\n");
 
                 return true;
             }
@@ -99,7 +109,23 @@ public class AssemblyStation {
     }
 
     /**
-     * Démarrer la boucle d'assemblage automatique
+     * NOUVEAU : Surveillance CONTINUE des niveaux
+     * Envoie des alertes périodiques tant que les zones sont vides/pleines
+     * Cela permet au serveur de démarrer les machines dès qu'elles se connectent
+     */
+    private void startContinuousMonitoring() {
+        monitoringThread.scheduleAtFixedRate(() -> {
+            try {
+                checkLevelsAndAlert();
+            } catch (Exception e) {
+                // Continuer la surveillance même en cas d'erreur
+            }
+        }, 2, 5, TimeUnit.SECONDS); // Démarre après 2s, puis toutes les 5s
+    }
+
+    /**
+     * Boucle d'assemblage automatique
+     * Tente d'assembler un produit toutes les 3 secondes
      */
     private void startAssemblyLoop() {
         assemblyThread.scheduleAtFixedRate(() -> {
@@ -108,20 +134,28 @@ public class AssemblyStation {
                 if (product != null) {
                     divider();
                     success("✅ PRODUIT ASSEMBLÉ: " + product.getProductId());
-                    info("   Composants utilisés: " + product.getComponents().size());
+                    info("   Composants: " + product.getComponents().size());
+
+                    // Afficher les détails des composants
+                    for (Component c : product.getComponents()) {
+                        info("      - " + c.getComponentId() + " (" + c.getType() + ")");
+                    }
+
                     divider();
                     printStatus();
+
+                    // Vérifier immédiatement après assemblage
                     checkLevelsAndAlert();
                 }
             } catch (Exception e) {
-                // Ignorer les erreurs pour continuer
+                // Continuer même en cas d'erreur
             }
         }, 3, 3, TimeUnit.SECONDS);
     }
 
     /**
-     * IMPORTANT: Méthode appelée par le serveur via CORBA
-     * Ne doit JAMAIS bloquer!
+     * Réception de composant depuis le serveur (callback CORBA)
+     * IMPORTANT: Ne doit JAMAIS bloquer!
      */
     public synchronized boolean receiveComponent(Component comp) {
         Queue<Component> zone = zones.get(comp.getType());
@@ -146,38 +180,56 @@ public class AssemblyStation {
         divider();
         printStatus();
 
+        // Vérifier immédiatement les niveaux après réception
         checkLevelsAndAlert();
 
         return true;
     }
 
+    /**
+     * Vérifier les niveaux de stockage et alerter le serveur
+     * APPELÉ PÉRIODIQUEMENT pour que le serveur sache toujours l'état
+     */
     private void checkLevelsAndAlert() {
         for (Map.Entry<String, Queue<Component>> entry : zones.entrySet()) {
             String zoneId = entry.getKey();
             int level = entry.getValue().size();
 
             try {
+                // Alertes selon les seuils
                 if (level == 0) {
+                    // Zone VIDE - Alerte critique
                     controlRef.notifyStorageAlert(zoneId, 0);
-                } else if (level >= maxCapacity) {
-                    controlRef.notifyStorageAlert(zoneId, 100);
-                } else if (level <= minCapacity) {
-                    controlRef.notifyStorageAlert(zoneId, level * 10);
                 }
+                else if (level >= maxCapacity) {
+                    // Zone PLEINE - Alerte critique
+                    controlRef.notifyStorageAlert(zoneId, 100);
+                }
+                else if (level <= minCapacity) {
+                    // Zone BASSE - Alerte warning
+                    int percentage = (level * 100) / maxCapacity;
+                    controlRef.notifyStorageAlert(zoneId, percentage);
+                }
+
             } catch (Exception e) {
-                // Ignorer
+                // Ignorer les erreurs de communication temporaires
             }
         }
     }
 
+    /**
+     * Tenter d'assembler un produit
+     * Nécessite au moins un composant de chaque type
+     */
     private synchronized Product tryAssemble() {
-        // Vérifier qu'on a au moins un de chaque type
+        // Vérifier qu'on a au moins un composant de chaque type
         for (Queue<Component> zone : zones.values()) {
             if (zone.isEmpty()) {
-                return null;
+                return null; // Pas assez de composants
             }
         }
 
+        // Créer le produit et retirer les composants
         String productId = stationId + "-P" + (++assembledCount);
         Product product = new Product(productId, zones.size());
 
@@ -191,6 +243,9 @@ public class AssemblyStation {
         return product;
     }
 
+    /**
+     * Afficher l'état des zones de stockage
+     */
     private void printStatus() {
         log("┌─────────────────────────────────────────────────┐");
         log("│           ZONES DE STOCKAGE                     │");
@@ -211,13 +266,19 @@ public class AssemblyStation {
         log("└─────────────────────────────────────────────────┘");
     }
 
+    /**
+     * Icône selon le niveau de stockage
+     */
     private String getIcon(int level) {
-        if (level == 0) return "🔴";
-        if (level >= maxCapacity) return "🔴";
-        if (level <= minCapacity) return "🟡";
-        return "🟢";
+        if (level == 0) return "🔴"; // Vide
+        if (level >= maxCapacity) return "🔴"; // Pleine
+        if (level <= minCapacity) return "🟡"; // Basse
+        return "🟢"; // OK
     }
 
+    /**
+     * Barre de progression visuelle
+     */
     private String generateBar(int level) {
         int filled = (level * 15) / maxCapacity;
         StringBuilder bar = new StringBuilder("[");
@@ -231,6 +292,7 @@ public class AssemblyStation {
     public void shutdown() {
         isRunning = false;
         assemblyThread.shutdown();
+        monitoringThread.shutdown();
         if (orb != null) {
             orb.shutdown(false);
         }
@@ -305,15 +367,16 @@ public class AssemblyStation {
             System.exit(1);
         }
 
-        // Menu interactif
+        // Menu simplifié - pas de contrôle manuel
         System.out.println("\n╔═══════════════════════════════════════════════════╗");
-        System.out.println("║                MENU STATION                      ║");
+        System.out.println("║         MENU STATION (MODE AUTO)                 ║");
         System.out.println("╠═══════════════════════════════════════════════════╣");
         System.out.println("║  1. Afficher état                                ║");
-        System.out.println("║  2. Forcer assemblage                            ║");
-        System.out.println("║  3. Quitter                                      ║");
+        System.out.println("║  2. Quitter                                      ║");
         System.out.println("╚═══════════════════════════════════════════════════╝");
         System.out.println();
+        System.out.println("ℹ️  Surveillance automatique des zones de stockage");
+        System.out.println("   Alertes envoyées toutes les 5 secondes\n");
 
         while (station.isRunning) {
             System.out.print(id + " > ");
@@ -325,23 +388,13 @@ public class AssemblyStation {
                     break;
 
                 case "2":
-                    Product p = station.tryAssemble();
-                    if (p != null) {
-                        System.out.println("✓ Produit assemblé: " + p.getProductId());
-                        station.printStatus();
-                    } else {
-                        System.out.println("✗ Composants manquants");
-                    }
-                    break;
-
-                case "3":
                     System.out.println("\n👋 Arrêt de la station " + id);
                     station.shutdown();
                     System.exit(0);
                     break;
 
                 default:
-                    System.out.println("❌ Commande invalide (1, 2 ou 3)");
+                    System.out.println("❌ Commande invalide (1 ou 2)");
             }
         }
     }

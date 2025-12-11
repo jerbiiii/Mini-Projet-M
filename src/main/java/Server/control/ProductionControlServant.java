@@ -5,6 +5,7 @@ import ProductionControlModule.*;
 
 /**
  * Servant CORBA - Délègue tout au ControlServer
+ * Inclut la nouvelle méthode notifyRepair
  */
 public class ProductionControlServant extends IProductionControlPOA {
 
@@ -22,6 +23,11 @@ public class ProductionControlServant extends IProductionControlPOA {
     @Override
     public String notifyFailure(String machineId, String errorType) {
         return server.handleFailure(machineId, errorType);
+    }
+
+    @Override
+    public boolean notifyRepair(String machineId) {
+        return server.handleRepair(machineId);
     }
 
     @Override
